@@ -7,16 +7,14 @@ import (
 	"sync"
 	"time"
 
-	peerState "github.com/florianlenz/go-libp2p-bootstrap/state/peers"
-	startedState "github.com/florianlenz/go-libp2p-bootstrap/state/started"
-	log "gx/ipfs/QmTG23dvpBCBjqQwyDxV8CQT6jmS4PSftNr1VqHhE3MLy7/go-log"
-	ma "gx/ipfs/QmWWQ2Txc2c6tqjsBpzg5Ar652cHPGNsQQp2SejkNmkUMb/go-multiaddr"
-	net "gx/ipfs/QmXoz9o2PT3tEzf7hicegwex5UgVP54n3k82K7jrWFyN86/go-libp2p-net"
-	peerstore "gx/ipfs/QmdeiKhUy1TVGBaKxt7y1QmBDLBdisSrLJ1x58Eoj4PXUh/go-libp2p-peerstore"
-	host "gx/ipfs/QmfZTdmunzKzAGJrSvXXQbQ5kLLUiEMX5vdwux7iXkdk7D/go-libp2p-host"
+	peerState "github.com/blocktop/go-libp2p-bootstrap/state/peers"
+	startedState "github.com/blocktop/go-libp2p-bootstrap/state/started"
+	glog "github.com/golang/glog"
+	host "github.com/libp2p/go-libp2p-host"
+	net "github.com/libp2p/go-libp2p-net"
+	peerstore "github.com/libp2p/go-libp2p-peerstore"
+	ma "github.com/multiformats/go-multiaddr"
 )
-
-var logger = log.Logger("bootstrap")
 
 //Bootstrap configuration
 //"HardBootstrap" is the time after we
@@ -32,15 +30,29 @@ type Config struct {
 	HardBootstrap     time.Duration
 }
 
+type wrappedTicker struct {
+	ticker *time.Ticker
+	closer chan struct{}
+}
+
 type Bootstrap struct {
-	minPeers          int
-	bootstrapPeers    []*peerstore.PeerInfo
-	host              host.Host
-	notifiee          *net.NotifyBundle
-	bootstrapInterval time.Duration
-	hardBootstrap     time.Duration
-	startedState      *startedState.State
-	peerState         *peerState.State
+	MinPeers       int
+	PeerCount      int
+	bootstrapPeers []*peerstore.PeerInfo
+	host           host.Host
+	notifiee       *net.NotifyBundle
+	bootstrap      wrappedTicker
+	hardBootstrap  wrappedTicker
+	startedState   *startedState.State
+	peerState      *peerState.State
+}
+
+func (b *Bootstrap) GetMinPeers() int {
+	return b.MinPeers
+}
+
+func (b *Bootstrap) GetPeerCount() int {
+	return b.PeerCount
 }
 
 //Bootstrap thought the list of bootstrap peer's
@@ -48,6 +60,10 @@ func (b *Bootstrap) Bootstrap(ctx context.Context) error {
 
 	if !b.startedState.HasStarted() {
 		return errors.New("you need to to call Start() first in order to manually bootstrap")
+	}
+
+	if len(b.bootstrapPeers) < b.MinPeers {
+		return errors.New("number of configured peers is less than minimum required to bootstrap")
 	}
 
 	var e error
@@ -59,13 +75,14 @@ func (b *Bootstrap) Bootstrap(ctx context.Context) error {
 		wg.Add(1)
 		go func(peer *peerstore.PeerInfo) {
 			defer wg.Done()
-			if b.peerState.Amount() < b.minPeers {
+			b.PeerCount = b.peerState.Amount()
+			if b.PeerCount < b.MinPeers {
 				if err := b.host.Connect(ctx, *peer); err != nil {
-					logger.Debug("Failed to connect to peer: ", peer)
+					glog.Infof("Contacting %s", peer)
 					e = err
 					return
 				}
-				logger.Debug("Connected to: ", peer)
+				glog.Infof("Connected to %s", peer)
 			}
 		}(peer)
 
@@ -73,8 +90,12 @@ func (b *Bootstrap) Bootstrap(ctx context.Context) error {
 
 	wg.Wait()
 
-	return e
+	b.PeerCount = b.peerState.Amount()
+	if b.PeerCount >= b.MinPeers {
+		return nil
+	}
 
+	return e
 }
 
 //Stop the bootstrap service
@@ -85,6 +106,11 @@ func (b *Bootstrap) Close() error {
 
 	b.host.Network().StopNotify(b.notifiee)
 	b.startedState.Stop()
+
+	// close the ticker
+	b.hardBootstrap.closer <- struct{}{}
+	b.bootstrap.closer <- struct{}{}
+
 	return nil
 }
 
@@ -114,48 +140,57 @@ func (b *Bootstrap) Start(ctx context.Context) error {
 	//Do an initial bootstrap
 	err := b.Bootstrap(ctx)
 
-	//Start the worker
+	// hard bootstrap
+	go func() {
+
+		for {
+			select {
+			case <-b.hardBootstrap.closer:
+				return
+			case <-b.hardBootstrap.ticker.C:
+				b.PeerCount = b.peerState.Amount()
+
+				// return when we are connected to enough peers
+				if b.PeerCount >= b.MinPeers {
+					continue
+				}
+
+				if err := b.Bootstrap(ctx); err != nil {
+					glog.Error(err)
+				}
+			}
+		}
+
+	}()
+
+	// normal bootstrap
 	go func() {
 
 		lastNetworkState := len(b.host.Network().Peers())
 
-		hb := time.Now()
-
 		for {
+			select {
+			case <-b.bootstrap.closer:
+				return
+			case <-b.bootstrap.ticker.C:
 
-			//Break in case we stopped the bootstrapping process
-			if !b.startedState.HasStarted() {
-				logger.Warning("stop worker since bootstrap hasn't started")
-				break
+				myAddresses := len(b.host.Network().Peers())
+
+				b.PeerCount = b.peerState.Amount()
+				//Continue when we are connected to the minPeer amount
+				if b.PeerCount >= b.MinPeers {
+					continue
+				}
+
+				// bootstrap on network delta (delta between the amount
+				// of our addresses and the last known amount of addresses)
+				if myAddresses != lastNetworkState {
+					lastNetworkState = myAddresses
+					if err := b.Bootstrap(ctx); err != nil {
+						glog.Error(err)
+					}
+				}
 			}
-
-			myAddresses := len(b.host.Network().Peers())
-			connectedPeers := b.peerState.Amount()
-
-			//Continue when we are connected to the minPeer amount
-			if connectedPeers >= b.minPeers {
-				logger.Info("already connected to enough peer's")
-				hb = time.Now()
-				time.Sleep(b.bootstrapInterval)
-				continue
-			}
-
-			//Bootstrap on network delta (delta between the amount of our addresses)
-			if myAddresses != lastNetworkState {
-				lastNetworkState = myAddresses
-				b.Bootstrap(context.Background())
-			}
-
-			//Hard bootstrap
-			if time.Now().After(hb.Add(b.hardBootstrap)) {
-				logger.Debug("Hard bootstrap")
-				b.Bootstrap(context.Background())
-				hb = time.Now()
-			}
-
-			//Wait some time for the new round
-			time.Sleep(b.bootstrapInterval)
-
 		}
 
 	}()
@@ -168,7 +203,7 @@ func (b *Bootstrap) Start(ctx context.Context) error {
 func New(h host.Host, c Config) (*Bootstrap, error) {
 
 	if c.MinPeers > len(c.BootstrapPeers) {
-		return nil, errors.New(fmt.Sprintf("Too less bootstrapping nodes. Expected at least: %d, got: %d", c.MinPeers, len(c.BootstrapPeers)))
+		return nil, errors.New(fmt.Sprintf("Too few bootstrapping nodes. Expected at least: %d, got: %d", c.MinPeers, len(c.BootstrapPeers)))
 	}
 
 	var peers []*peerstore.PeerInfo
@@ -190,13 +225,19 @@ func New(h host.Host, c Config) (*Bootstrap, error) {
 	}
 
 	return &Bootstrap{
-		minPeers:          c.MinPeers,
-		bootstrapPeers:    peers,
-		host:              h,
-		hardBootstrap:     c.HardBootstrap,
-		bootstrapInterval: c.BootstrapInterval,
-		startedState:      startedState.StateFactory(),
-		peerState:         peerState.StateFactory(),
+		MinPeers:       c.MinPeers,
+		bootstrapPeers: peers,
+		host:           h,
+		hardBootstrap: wrappedTicker{
+			ticker: time.NewTicker(c.HardBootstrap),
+			closer: make(chan struct{}),
+		},
+		bootstrap: wrappedTicker{
+			ticker: time.NewTicker(c.BootstrapInterval),
+			closer: make(chan struct{}),
+		},
+		startedState: startedState.StateFactory(),
+		peerState:    peerState.StateFactory(),
 	}, nil
 
 }
